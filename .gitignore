@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Local attempt-log database (contains this machine's own webcam session
+# data, not source) - regenerated automatically by utils/logger.py.
+deepcheck_logs.db
+*.db

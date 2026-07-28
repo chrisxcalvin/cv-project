@@ -1,0 +1,11 @@
+mediapipe==0.10.21
+opencv-python<4.12
+numpy<2
+scipy
+streamlit
+torch
+torchvision
+onnxruntime
+scikit-learn
+matplotlib
+pytest
