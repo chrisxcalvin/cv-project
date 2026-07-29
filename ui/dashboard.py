@@ -105,6 +105,8 @@ def render_live_demo_tab():
         st.session_state.last_main_capture_id = None
     if "confidence_history" not in st.session_state:
         st.session_state.confidence_history = []
+    if "challenge_retry_count" not in st.session_state:
+        st.session_state.challenge_retry_count = 0
 
     img_file = st.camera_input("Capture your face", key="main_capture")
 
@@ -115,6 +117,7 @@ def render_live_demo_tab():
         if img_file.file_id != st.session_state.last_main_capture_id:
             st.session_state.pending_challenge = None
             st.session_state.pending_passive_result = None
+            st.session_state.challenge_retry_count = 0
             st.session_state.last_main_capture_id = img_file.file_id
 
         frame = camera_input_to_bgr(img_file)
@@ -125,6 +128,7 @@ def render_live_demo_tab():
             st.error("No face detected. Please recapture with your face clearly visible.")
             st.session_state.pending_challenge = None
             st.session_state.pending_passive_result = None
+            st.session_state.challenge_retry_count = 0
         elif num_faces > MAX_FACES_ALLOWED:
             # Blocks a common attack: holding a printed photo up next to
             # your own real face so either one can be swapped in as needed.
@@ -134,6 +138,7 @@ def render_live_demo_tab():
             )
             st.session_state.pending_challenge = None
             st.session_state.pending_passive_result = None
+            st.session_state.challenge_retry_count = 0
         else:
             passive_result = classifier.predict(face_crop)
             decision = fusion.decide(passive_result)
@@ -198,8 +203,10 @@ def render_live_demo_tab():
                 challenge = st.session_state.pending_challenge
                 prompt = {
                     "blink": "Blink your eyes, then capture the photo below.",
-                    "turn_left": "Turn your head LEFT, then capture the photo below.",
-                    "turn_right": "Turn your head RIGHT, then capture the photo below.",
+                    "turn_left": "Turn your head slightly LEFT - just a few degrees, "
+                                 "keep most of your face visible - then capture the photo below.",
+                    "turn_right": "Turn your head slightly RIGHT - just a few degrees, "
+                                  "keep most of your face visible - then capture the photo below.",
                     "mouth_open": "Open your mouth, then capture the photo below.",
                 }[challenge]
 
@@ -221,44 +228,66 @@ def render_live_demo_tab():
                         active_result = active_challenge.evaluate_single_frame(
                             challenge_frame, challenge
                         )
-                        # The challenge photo must ALSO not look like a spoof -
-                        # otherwise a fake photo could be shown first (landing
-                        # in the uncertain band) and then swapped for a real
-                        # face just to satisfy the gesture.
-                        challenge_passive_result = classifier.predict(challenge_crop)
-                        decision = fusion.decide(
-                            st.session_state.pending_passive_result, active_result,
-                            challenge_passive_result,
-                        )
 
-                        st.subheader("Challenge Measurement")
-                        st.write(
-                            f"Challenge photo spoof-check: real_confidence = "
-                            f"{challenge_passive_result['real_confidence']:.2f} "
-                            f"(must be above {DecisionFusion.REJECT_THRESHOLD:.2f})"
-                        )
-                        if active_result["reason"] == "no_face_detected":
-                            st.write(
-                                "Could not track facial landmarks on the challenge "
-                                "photo (often happens if the turn was too extreme, "
-                                "or the face was partly out of frame). Try again with "
-                                "a clearer, more moderate motion."
+                        if (active_result["reason"] == "no_face_detected"
+                                and st.session_state.challenge_retry_count < 1):
+                            # Face Mesh needs more of the face's geometry
+                            # visible than the plain face detector above, so
+                            # it can fail to resolve landmarks (e.g. an
+                            # over-turned head) even when a face was clearly
+                            # present. That's usually a one-off tracking
+                            # hiccup for a genuine user, so give ONE free
+                            # retry instead of instantly wiping the whole
+                            # attempt (decision stays PENDING from the
+                            # passive-only check above, so nothing is logged
+                            # yet). Capped at one retry, though: a flat
+                            # printed/screen photo tilted to fake a turn
+                            # will keep failing to track no matter how many
+                            # times it's retried, so unlimited retries would
+                            # just let that kind of spoof attempt keep
+                            # rolling the dice instead of being rejected.
+                            st.session_state.challenge_retry_count += 1
+                            st.warning(
+                                "Couldn't track facial landmarks on that photo "
+                                "(often happens if the turn was too far, or the "
+                                "face was partly out of frame). Keep more of "
+                                "your face visible and recapture the challenge "
+                                "photo below."
                             )
-                        elif challenge == "blink":
-                            st.write(f"EAR must drop below {EAR_BLINK_THRESHOLD:.2f} (yours: {active_result['ear_min']:.3f})")
-                        elif challenge == "turn_left":
-                            st.write(f"signed yaw offset must be ≥ {HEAD_TURN_THRESHOLD:.2f} (yours: {active_result['yaw_signed']:.3f})")
-                        elif challenge == "turn_right":
-                            st.write(f"signed yaw offset must be ≤ -{HEAD_TURN_THRESHOLD:.2f} (yours: {active_result['yaw_signed']:.3f})")
-                        elif challenge == "mouth_open":
-                            st.write(f"MAR must exceed {MOUTH_OPEN_THRESHOLD:.2f} (yours: {active_result['mar']:.3f})")
-                        st.write(f"Result: **{'PASSED' if active_result['passed'] else 'FAILED'}** ({active_result['reason']})")
+                        else:
+                            # The challenge photo must ALSO not look like a spoof -
+                            # otherwise a fake photo could be shown first (landing
+                            # in the uncertain band) and then swapped for a real
+                            # face just to satisfy the gesture.
+                            challenge_passive_result = classifier.predict(challenge_crop)
+                            decision = fusion.decide(
+                                st.session_state.pending_passive_result, active_result,
+                                challenge_passive_result,
+                            )
 
-                        st.session_state.pending_challenge = None
-                        st.session_state.pending_passive_result = None
+                            st.subheader("Challenge Measurement")
+                            st.write(
+                                f"Challenge photo spoof-check: real_confidence = "
+                                f"{challenge_passive_result['real_confidence']:.2f} "
+                                f"(must be above {DecisionFusion.REJECT_THRESHOLD:.2f})"
+                            )
+                            if challenge == "blink":
+                                st.write(f"EAR must drop below {EAR_BLINK_THRESHOLD:.2f} (yours: {active_result['ear_min']:.3f})")
+                            elif challenge == "turn_left":
+                                st.write(f"signed yaw offset must be ≥ {HEAD_TURN_THRESHOLD:.2f} (yours: {active_result['yaw_signed']:.3f})")
+                            elif challenge == "turn_right":
+                                st.write(f"signed yaw offset must be ≤ -{HEAD_TURN_THRESHOLD:.2f} (yours: {active_result['yaw_signed']:.3f})")
+                            elif challenge == "mouth_open":
+                                st.write(f"MAR must exceed {MOUTH_OPEN_THRESHOLD:.2f} (yours: {active_result['mar']:.3f})")
+                            st.write(f"Result: **{'PASSED' if active_result['passed'] else 'FAILED'}** ({active_result['reason']})")
+
+                            st.session_state.pending_challenge = None
+                            st.session_state.pending_passive_result = None
+                            st.session_state.challenge_retry_count = 0
             else:
                 st.session_state.pending_challenge = None
                 st.session_state.pending_passive_result = None
+                st.session_state.challenge_retry_count = 0
 
             if decision["verdict"] != "PENDING":
                 st.subheader("Final Verdict")

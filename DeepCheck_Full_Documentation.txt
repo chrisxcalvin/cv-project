@@ -1,0 +1,650 @@
+================================================================================
+DEEPCHECK - FULL PROJECT DOCUMENTATION
+Technical writeup for team + evaluator Q&A
+================================================================================
+
+Everything each of the three team members needs to explain their part of
+DeepCheck to evaluators: what was built, why it works the way it does, the
+exact thresholds and formulas involved, and the honest limitations to
+volunteer before being asked.
+
+Repo: github.com/chrisxcalvin/cv-project
+
+
+CONTENTS
+--------
+ 1. Project overview & architecture
+ 2. How to run it
+ 3. Person A - passive detection & the CNN
+ 4. Person B - face & liveness detection
+ 5. Person C - fusion, dashboard & infra
+ 6. Worked example: one attempt, end to end
+ 7. Testing
+ 8. Syllabus mapping
+ 9. Known limitations (say these first)
+10. Roadmap / next steps
+11. Appendix: file map
+
+
+================================================================================
+1. PROJECT OVERVIEW & ARCHITECTURE
+================================================================================
+
+DeepCheck is a webcam-based face liveness / anti-spoofing demo built for a
+computer vision course. It decides whether a face in front of a camera is a
+real live person or a print/screen replay attempt, using three stages:
+
+  [Person A]              [Person B]               [Person C]
+  Passive scoring    -->  Active challenge     -->  Decision fusion
+  4 classical CV         If ambiguous, a           Combines both into
+  features (+ optional    blink/turn/mouth-        one ACCEPT / REJECT /
+  CNN) score the face     open gesture must         PENDING verdict,
+  crop 0-1                be verified via           logged and displayed
+                          landmarks
+
+The passive score alone decides confidently-real and confidently-fake cases.
+Only the ambiguous middle band (real_confidence between 0.30 and 0.75) needs
+the active challenge - deliberate design: don't bother a genuine user with a
+gesture prompt when passive features already agree, but don't accept a
+borderline case on passive evidence alone either.
+
+The whole system runs with ZERO external services and NO required trained
+model - the rule-based passive path works out of the box, and a small CNN
+checkpoint can be swapped in automatically if present.
+
+
+================================================================================
+2. HOW TO RUN IT
+================================================================================
+
+  # one-time setup
+  python -m venv .venv
+  .venv\Scripts\activate
+  pip install -r requirements.txt
+
+  # Streamlit dashboard (default)
+  python main.py
+
+  # raw OpenCV live window instead
+  python main.py --live
+
+  # run the test suite
+  pytest tests -v
+
+  # (re)train the toy CNN checkpoint
+  python scripts/train_toy_model.py
+
+No API keys, no external services, no GPU required. Everything the training
+script downloads (LFW faces, MobileNetV2 ImageNet weights) comes from public,
+ungated sources.
+
+
+================================================================================
+3. PERSON A - PASSIVE DETECTION & THE CNN
+================================================================================
+
+Owns: core/spatial_features.py, core/frequency_features.py,
+      core/passive_classifier.py, scripts/train_toy_model.py
+
+Person A's code answers one question from a single still photo: does this
+face look like a real live face, or like a printed photo / screen replay? It
+never looks at motion or gestures - that's Person B's job. Four independent,
+classical image-processing cues are computed, then fused into one
+real_confidence score between 0 (spoof) and 1 (real).
+
+--------------------------------------------------------------------------
+Preprocessing & edge detection            spatial_features.py :: preprocess(), canny_edges()
+--------------------------------------------------------------------------
+preprocess() runs a 5x5 Gaussian blur (sigma=1.0) to cut webcam sensor noise,
+then a Laplacian sharpening kernel ([[0,-1,0],[-1,5,-1],[0,-1,0]]) on top of
+the blurred image to exaggerate fine edge structure - pores, hair,
+eyelashes. Intuition: a real face carries rich fine detail that survives
+sharpening; a printed photo or screen replay tends to look flatter/smoother
+because it already lost detail in the print/display process.
+
+canny_edges() runs Canny edge detection (thresholds 50/150) on the grayscale
+crop and reports edge_density = fraction of pixels that are edge pixels.
+More, more-complex edges -> leans real.
+
+--------------------------------------------------------------------------
+Texture flatness via Otsu                 spatial_features.py :: otsu_texture_score()
+--------------------------------------------------------------------------
+Converts to grayscale and computes raw pixel-value variance as a fast
+texture pre-screen (Otsu's threshold is also computed for the visual
+display, but the decision itself uses variance, not the Otsu threshold
+value). A very low variance means large flat regions - typical of a printed
+photo's paper texture - while a real face has naturally uneven
+lighting/skin texture.
+
+--------------------------------------------------------------------------
+Keypoint richness via ORB                 spatial_features.py :: orb_keypoint_score()
+--------------------------------------------------------------------------
+Runs ORB (Oriented FAST and Rotated BRIEF, nfeatures=500) on the grayscale
+crop and counts detected keypoints. Real faces yield more, irregularly
+distributed keypoints; prints/screens yield fewer, or grid-like ones from
+the printing/pixel structure.
+
+--------------------------------------------------------------------------
+Frequency-domain analysis                 frequency_features.py :: analyze()
+--------------------------------------------------------------------------
+Takes the 2D FFT of the grayscale crop, shifts it so DC sits at the center,
+and splits energy into a low-frequency disk (radius = min(h,w) // 8) versus
+everything outside it:
+
+    high_freq_ratio = sum(magnitude[dist > inner_radius]) / sum(magnitude)
+
+Printed photos show halftone dot patterns; screen replays show a
+pixel/subpixel grid - both inject energy into high spatial frequencies that
+a genuine face photographed directly does not have. A high ratio leans
+spoof.
+
+--------------------------------------------------------------------------
+Rule-based fusion (works with zero training)   passive_classifier.py :: predict()
+--------------------------------------------------------------------------
+When no trained model file exists, the four raw measurements are each
+normalized to 0-1 and combined with hand-picked weights:
+
+    texture_score = min(texture_var / 500.0, 1.0)
+    orb_score     = min(orb_count  / 200.0, 1.0)
+    fft_score     = 1.0 - min(fft_ratio / 0.85, 1.0)   # inverted: more high-freq = more spoof
+    edge_score    = min(edge_density / 0.15, 1.0)
+
+    real_confidence = 0.35*texture_score + 0.25*orb_score
+                     + 0.25*fft_score + 0.15*edge_score
+
+The weights and normalization divisors (500, 200, 0.85, 0.15) were
+hand-picked to behave plausibly on a webcam - NOT fit against a labeled
+dataset. Say this proactively; it's covered again in section 9.
+
+--------------------------------------------------------------------------
+Explainability breakdown        passive_classifier.py :: predict() - weighted_breakdown
+--------------------------------------------------------------------------
+Alongside the raw feature values, the classifier also returns each
+feature's actual point contribution to the final score (weight x sub_score,
+not just the raw 0-1 sub-score) - this powers the dashboard's
+"Explainability" bar chart, showing not just what the score was but which
+cue drove it.
+
+--------------------------------------------------------------------------
+Spoof-type sub-classification    passive_classifier.py :: classify_spoof_type()
+--------------------------------------------------------------------------
+Once real_confidence already reads as spoof (<= PASSIVE_REJECT_THRESHOLD =
+0.30), a second heuristic decides whether it looks more like a PRINTED
+PHOTO or a SCREEN REPLAY, reusing the FFT ratio and texture variance
+already computed:
+
+    if fft_ratio >= REPLAY_FFT_RATIO_MIN (0.24):       screen_replay
+    elif texture_var <= OTSU_TEXTURE_THRESHOLD (15.0): printed_photo
+    else:                                              unclear_spoof_type
+
+Rationale: a screen's RGB sub-pixel grid tends to concentrate MORE
+high-frequency FFT energy than a printed halftone dot pattern at typical
+webcam distance, so a high ratio leans replay; a very flat, low-variance
+surface with only moderately elevated FFT energy leans print. This is
+illustrative, not calibrated against a real print-vs-replay attack dataset
+- say so if asked.
+
+--------------------------------------------------------------------------
+The CNN branch & toy checkpoint
+  passive_classifier.py :: _load_model(), _cnn_predict()
+  scripts/train_toy_model.py
+--------------------------------------------------------------------------
+If models/passive_spoof_model.pt exists, a MobileNetV2 (final classifier
+layer replaced with a 2-class linear head) loads instead and the rule-based
+path is skipped entirely - this swap is automatic and silent, decided once
+at PassiveClassifier.__init__ time.
+
+The checkpoint was trained by scripts/train_toy_model.py: real faces come
+from LFW (Labeled Faces in the Wild - real color photographs, publicly
+downloadable via scikit-learn, no signup gate), and the spoof class is the
+SAME photos synthetically degraded three ways to mimic what a print/replay
+actually does to an image:
+
+  1. Downsample 4x then upsample back - resolution-loss blockiness, like a
+     screen replay
+  2. A periodic halftone dot mask (period 4px) multiplied over the image -
+     mimics print dot patterns
+  3. Heavy JPEG re-compression (quality 15) - compression-artifact noise
+
+Random brightness/contrast jitter is also applied per photo, since webcam
+lighting varies far more than LFW's studio-ish shots. The backbone is
+frozen; only the 2-class classifier head is fine-tuned (Adam, lr=1e-3, 6
+epochs, batch 16) - affordable on CPU in a few minutes given the small
+dataset.
+
+  >>> SAY THIS BEFORE YOU'RE ASKED <<<
+  This is a proof-of-concept, not a validated spoof detector. No real
+  printed photo or screen replay was ever captured for training - the
+  spoof class is synthetic degradation of real photos. It proves the CNN
+  code path (checkpoint file -> load -> inference) is wired correctly end
+  to end, on inputs that at least resemble what a webcam captures (a v1
+  attempt trained on grayscale-collapsed data and scored real faces near
+  50%, i.e. pure guessing, until this was fixed). Report validation
+  accuracy only in the context of that synthetic task, not as a
+  real-world accuracy claim.
+
+ANTICIPATED QUESTIONS FOR PERSON A:
+  Q: "How accurate is it?"
+  A: On the synthetic train/val split, high - but that number describes
+     separating real photos from JPEG/halftone-degraded copies of
+     themselves, not real spoof attacks. No accuracy claim can honestly be
+     made against real prints/replays without collecting that data.
+
+  Q: "Why these specific weights (0.35/0.25/0.25/0.15)?"
+  A: Hand-tuned to behave plausibly on a webcam, not fit to labeled data.
+     Properly calibrating them would mean collecting real attack photos,
+     computing an ROC curve per feature, and picking weights/thresholds
+     that optimize it.
+
+  Q: "What breaks this?"
+  A: A high-quality, well-lit print or a high-resolution screen replay at
+     close range can push texture/edge/FFT scores into the "real" range -
+     a documented limitation of hand-engineered features in the
+     anti-spoofing literature, not unique to this implementation.
+
+
+================================================================================
+4. PERSON B - FACE & LIVENESS DETECTION
+================================================================================
+
+Owns: core/face_detector.py, core/active_challenge.py
+
+Person B answers two questions: where is the face, and is exactly one real
+person present (face_detector.py), and can this face perform a requested
+live gesture (active_challenge.py) - the layer that catches spoofs a static
+photo can pass on passive score alone.
+
+--------------------------------------------------------------------------
+Face localization & the multi-face guard        face_detector.py
+--------------------------------------------------------------------------
+detect_and_crop() runs MediaPipe Face Detection on the raw frame, picks the
+highest-confidence detection (min_detection_confidence=0.6), pads the box
+by 20% on each side, and resizes the crop to a fixed 224x224 square that
+every downstream feature extractor expects.
+
+count_faces() is a separate, newer method: it counts ALL detections in the
+frame rather than just returning the best one. The dashboard rejects
+outright - before any scoring happens at all - any frame with more than
+MAX_FACES_ALLOWED (1) face. This blocks a specific, common trick: holding a
+printed photo up next to your own real face so whichever one is convenient
+can be swapped in as needed. Without this guard, detect_and_crop()'s
+"pick the best one" behavior would silently ignore the second face and let
+the attempt proceed.
+
+--------------------------------------------------------------------------
+Eye Aspect Ratio (blink detection)   active_challenge.py :: _ear_from_points(), _compute_ear()
+--------------------------------------------------------------------------
+Standard EAR formula (Soukupova & Cech, 2016) from six eye-contour
+landmarks per eye (MediaPipe Face Mesh's 468-point topology):
+
+    EAR = ( ||p2-p6|| + ||p3-p5|| ) / ( 2 * ||p1-p4|| )
+
+Averaged across both eyes. A closed eye has near-zero vertical distance, so
+EAR drops sharply - below EAR_BLINK_THRESHOLD (0.21, relaxed to 0.24 in
+glasses mode since lenses distort the eye contour) counts as a detected
+blink.
+
+--------------------------------------------------------------------------
+Head-turn detection (yaw)            active_challenge.py :: _compute_yaw()
+--------------------------------------------------------------------------
+    cheek_mid  = (left_cheek_x + right_cheek_x) / 2
+    yaw_offset = (nose_tip_x - cheek_mid) / |right_cheek_x - left_cheek_x|
+
+A cheap 2D proxy for yaw - no full 3D solvePnP needed for a binary
+"turned enough" decision. Note the mirrored-capture subtlety: a user
+physically turning their OWN right measures as yaw_offset < 0, not > 0,
+because browser webcam capture is mirrored relative to MediaPipe's
+anatomical labelling. required_sign in evaluate_single_frame() is
+calibrated for that mirroring, not the anatomical comment above the
+function - worth knowing cold if an evaluator asks you to trace the logic.
+HEAD_TURN_THRESHOLD = 0.07 is deliberately small: only a slight turn is
+required.
+
+--------------------------------------------------------------------------
+Mouth-open detection (MAR)     active_challenge.py :: _mar_from_points(), _compute_mar()
+--------------------------------------------------------------------------
+Same vertical/horizontal ratio idea as EAR, applied to the mouth
+(landmarks: left corner, upper inner lip, right corner, lower inner lip):
+
+    MAR = ||top-bottom|| / ||left-right||
+
+A closed/resting mouth measures roughly 0.05-0.15; an open mouth or
+smile-with-teeth typically exceeds MOUTH_OPEN_THRESHOLD (0.5) - this
+threshold is heuristic, not calibrated against a labeled mouth-state
+dataset, same caveat as the EAR/yaw thresholds.
+
+--------------------------------------------------------------------------
+Two evaluation modes
+  active_challenge.py :: evaluate_single_frame() vs run_challenge()
+--------------------------------------------------------------------------
+evaluate_single_frame() is what the Streamlit dashboard uses - it judges a
+single captured photo, because st.camera_input only ever gives you
+discrete photos, not a live stream. run_challenge() is what
+main.py --live uses instead - it reads a continuous cv2.VideoCapture
+stream and requires the gesture to hold for N_FRAME_CONFIRM (3)
+consecutive frames before counting it, rejecting single-frame detector
+noise. KNOW WHICH MODE YOU'RE DEMOING: the "N-frame confirmation" claim in
+the syllabus table only applies to --live mode, not the Streamlit
+dashboard's single-photo challenge capture.
+
+  >>> A REAL FINDING WORTH MENTIONING <<<
+  MediaPipe Face Mesh needs more of the face's 3D geometry visible than
+  the plain face detector to resolve landmarks at all. A real head can
+  turn slightly and still track fine; a FLAT PHOTO tilted to fake the same
+  turn distorts in ways a genuine 3D face never does, and Face Mesh
+  frequently fails to find any landmarks on it (reason:
+  "no_face_detected"). This was observed directly during testing - trying
+  to satisfy a turn-left/right challenge with a phone-displayed photo
+  produced exactly this failure, which is a legitimate (if partly
+  accidental) security property: a static image structurally cannot
+  perform a 3D gesture. Person C's dashboard code gives one free retry for
+  this (to not punish a real user who simply over-turned) but finalizes
+  REJECT on a second consecutive failure, so an attacker can't just keep
+  re-rolling the dice - see section 5.
+
+ANTICIPATED QUESTIONS FOR PERSON B:
+  Q: "Why do live and dashboard modes detect turns differently?"
+  A: Because Streamlit can't stream raw webcam frames into a Python
+     backend reliably (st.camera_input is a photo-capture widget, not a
+     socket), so the dashboard only ever gets single frames -
+     evaluate_single_frame() exists specifically to cope with that
+     constraint.
+
+  Q: "What if I have glasses / bad lighting?"
+  A: Glasses have a dedicated, more lenient EAR threshold. Bad lighting is
+     a genuine unmitigated weak point - MediaPipe's landmark confidence
+     (0.5 for both detection and tracking) can degrade in poor light, and
+     there's no fallback for that here.
+
+  Q: "Could someone fake a blink with a video?"
+  A: Plausibly, yes - this system checks that A blink happened, not that
+     the source is a live camera rather than a replayed video of a person
+     blinking. A real gap, worth naming rather than hiding (see roadmap,
+     section 10, on rPPG).
+
+
+================================================================================
+5. PERSON C - FUSION, DASHBOARD & INFRA
+================================================================================
+
+Owns: core/fusion.py, ui/dashboard.py, ui/visualizer.py, utils/logger.py,
+      main.py
+
+Person C is the glue: combining A's score and B's gesture result into one
+verdict, building the UI both demo modes run through, and persisting every
+attempt for the Analytics tab.
+
+--------------------------------------------------------------------------
+Decision fusion                    fusion.py :: DecisionFusion.decide()
+--------------------------------------------------------------------------
+    real_confidence >= 0.75 (ACCEPT_THRESHOLD)  -> ACCEPT, no challenge needed
+    real_confidence <= 0.30 (REJECT_THRESHOLD)  -> REJECT, no challenge needed
+    otherwise (uncertain band)                  -> requires an active challenge
+        active challenge passed   -> ACCEPT*
+        active challenge failed   -> REJECT
+        not yet attempted         -> PENDING
+
+*with one more check: the challenge photo ITSELF is re-scored by the
+passive classifier, and if that photo alone looks like a spoof
+(real_confidence <= REJECT_THRESHOLD), the verdict flips to REJECT anyway
+with reason: "challenge_photo_looks_spoofed". This closes a real hole:
+without it, someone could show a spoof photo first (landing in the
+uncertain band), then swap in their real face just long enough to perform
+the blink/turn - passing the gesture alone isn't proof the whole attempt
+was legitimate.
+
+--------------------------------------------------------------------------
+The Streamlit dashboard                     ui/dashboard.py
+--------------------------------------------------------------------------
+Captures a photo via st.camera_input, runs face detection + the multi-face
+guard, then the passive classifier, then - only if needed - the active
+challenge flow, rendering feature views (edges/ORB keypoints/FFT
+spectrum), the explainability bar chart, a session-long confidence trend
+line chart, the final verdict, and a downloadable PNG report. All state
+(which challenge is pending, retry counts, capture history) lives in
+st.session_state because Streamlit re-runs the whole script top-to-bottom
+on every interaction.
+
+--------------------------------------------------------------------------
+The tracking-hiccup fix              ui/dashboard.py :: render_live_demo_tab()
+--------------------------------------------------------------------------
+When the active challenge returns reason: "no_face_detected" (Face Mesh
+couldn't resolve landmarks - see Person B's section), the dashboard does
+NOT immediately finalize a REJECT. A one-shot challenge_retry_count in
+session state grants one free recapture of just the challenge photo (the
+original passive score and pending challenge stay intact - nothing is
+logged yet). A SECOND consecutive tracking failure in the same cycle falls
+through to the normal decision path and finalizes as REJECT. This balances
+two failure modes: a genuine user who over-turned gets a fair second try,
+but a static-photo spoof that can never produce trackable landmarks
+doesn't get unlimited attempts to get lucky.
+
+--------------------------------------------------------------------------
+SQLite attempt logging                      utils/logger.py
+--------------------------------------------------------------------------
+Every finalized attempt (ACCEPT/REJECT, never PENDING) is written to
+deepcheck_logs.db - one row per attempt, with every passive feature value,
+the method used, spoof type, active-challenge outcome, and EAR/yaw/MAR
+measurements. init_db() uses CREATE TABLE IF NOT EXISTS plus a
+column-existence check per migration, and - after a real bug - now runs
+UNCONDITIONALLY on every logging/read call rather than only when the
+database file doesn't exist yet. The original file-existence gate silently
+skipped adding new columns (spoof_type) to an already-existing database,
+which crashed the Analytics tab with KeyError: 'spoof_type' until fixed.
+
+--------------------------------------------------------------------------
+The --live OpenCV window                main.py, ui/visualizer.py
+--------------------------------------------------------------------------
+main.py is the single entry point for both modes: python main.py launches
+Streamlit; --live runs a raw cv2.VideoCapture loop instead, with
+ui/visualizer.py supplying the overlay-drawing helpers (verdict banner,
+feature panel, rolling EAR graph, challenge prompt, FFT inset thumbnail)
+drawn directly onto each frame with cv2.addWeighted for the translucent
+panels.
+
+ANTICIPATED QUESTIONS FOR PERSON C:
+  Q: "Why Streamlit and not a raw video feed?"
+  A: Documented directly in dashboard.py's module docstring: OpenCV webcam
+     access doesn't work reliably inside a Streamlit app process, so
+     photo-capture (st.camera_input) is used instead - a real, deliberate
+     constraint, not an oversight.
+
+  Q: "What happens to PENDING attempts - are they logged?"
+  A: No - only finalized ACCEPT/REJECT verdicts get written via
+     log_attempt(). A challenge still in progress, or one that hit the
+     one-shot retry, produces no database row.
+
+  Q: "How would you know if the logging bug happened again?"
+  A: It wouldn't in the same way - the fix made schema migration
+     unconditional and idempotent, so any future new column gets added on
+     the very next call regardless of whether the database file already
+     existed. That class of bug is closed, not just patched for
+     spoof_type specifically.
+
+
+================================================================================
+6. WORKED EXAMPLE: ONE ATTEMPT, END TO END
+================================================================================
+
+Tracing demo scenario 4 (borderline case) through all three people's code,
+showing exactly where ownership hands off:
+
+  1. Capture & face localization                          [Person B]
+     face_detector.detect_and_crop(frame) finds the face, pads and resizes
+     to 224x224. count_faces() confirms exactly one face - the multi-face
+     guard passes.
+
+  2. Passive scoring                                       [Person A]
+     classifier.predict(face_crop) computes texture variance, ORB count,
+     FFT ratio, edge density, fuses them into real_confidence = 0.53 -
+     squarely in the 0.30-0.75 uncertain band. classify_spoof_type()
+     returns None (score isn't spoof-leaning enough yet to guess a type).
+
+  3. Fusion requests a challenge                           [Person C]
+     fusion.decide(passive_result) sees the uncertain band and no
+     active_result yet -> returns verdict: PENDING. The dashboard picks a
+     random challenge (say, turn_left) and prompts the user.
+
+  4. Active challenge evaluation                           [Person B]
+     A second photo is captured. active_challenge.evaluate_single_frame()
+     computes yaw_offset from Face Mesh landmarks and checks it against
+     HEAD_TURN_THRESHOLD (0.07) with the mirrored-capture sign flip
+     applied.
+
+  5. Challenge-photo spoof re-check                        [Person A + C]
+     The challenge photo is ALSO run through classifier.predict() - this
+     is Person A's code invoked a second time, called from Person C's
+     dashboard, specifically to block the "swap in a real face just for
+     the gesture" attack.
+
+  6. Final fusion & logging                                [Person C]
+     fusion.decide(passive_result, active_result, challenge_passive_result)
+     finalizes ACCEPT or REJECT. db_logger.log_attempt() writes one row to
+     SQLite; the dashboard renders the verdict and offers the PNG report
+     download.
+
+
+================================================================================
+7. TESTING
+================================================================================
+
+29 pytest tests, all currently passing, covering the deterministic core
+logic:
+
+  File                          Tests   Covers
+  ---------------------------   -----   ------------------------------------
+  test_fusion.py                  6     Every threshold-band branch of
+                                         DecisionFusion.decide(), including
+                                         the challenge-photo-looks-spoofed
+                                         override
+  test_spatial_features.py        7     Blur/sharpen shape preservation;
+                                         Canny/Otsu/ORB correctly separate a
+                                         flat image from a textured one
+  test_frequency_features.py      2     FFT ratio stays in [0,1]; a
+                                         checkerboard (high-freq) scores
+                                         above a flat image
+  test_passive_classifier.py      7     Rule-based/CNN mode switching,
+                                         result-dict shape, all four
+                                         classify_spoof_type() branches
+  test_active_challenge.py        4     EAR/MAR formulas rank open vs.
+                                         closed correctly; degenerate
+                                         (zero-width) inputs return 0
+                                         instead of dividing by zero
+  test_face_detector.py           3     count_faces() and detect_and_crop()
+                                         handle None/blank frames without
+                                         crashing
+
+  >>> HONEST GAP <<<
+  The Streamlit dashboard's session-state flow (retry counter, challenge
+  sequencing, PENDING handling) has NO automated test coverage - it's UI
+  logic driven by st.session_state, which is awkward to unit test outside
+  a running Streamlit process. It's been exercised manually, not
+  automatically. If asked "what's untested," this is the honest answer.
+
+
+================================================================================
+8. SYLLABUS MAPPING
+================================================================================
+
+  #    Technique                              Where                                          Owner
+  ---  -------------------------------------  ---------------------------------------------  -----
+  1    Smoothing spatial filter (Gaussian)     spatial_features.py :: preprocess()             A
+  2    Sharpening spatial filter (Laplacian)   spatial_features.py :: preprocess()             A
+  3    Edge detection (Canny)                  spatial_features.py :: canny_edges()            A
+  4    Thresholding (Otsu)                     spatial_features.py :: otsu_texture_score()     A
+  5    Feature detection/description (ORB)     spatial_features.py :: orb_keypoint_score()     A
+  6    Frequency domain (2D FFT)               frequency_features.py :: analyze()              A
+  7    Object detection                        face_detector.py                                B
+  8    Landmark tracking (EAR / yaw / MAR)     active_challenge.py                             B
+  9    Decision fusion (feature-level + top)   passive_classifier.py, fusion.py                A + C
+  10   CNN / transfer learning                 passive_classifier.py, scripts/train_toy_model  A
+
+
+================================================================================
+9. KNOWN LIMITATIONS (SAY THESE FIRST)
+================================================================================
+
+Volunteering these upfront reads as engineering maturity, not weakness - it
+shows the team understands what was built, not just that it runs.
+
+  - THRESHOLDS ARE HEURISTIC. Every threshold and fusion weight in
+    utils/constants.py was hand-picked to behave plausibly on a webcam,
+    not fit against a labeled dataset or an ROC curve.
+
+  - THE CNN CHECKPOINT IS A TOY. Trained on real photos (LFW) vs.
+    synthetically degraded copies of themselves - proves the code path
+    works, has never seen a real print or replay attack.
+
+  - SPOOF-TYPE CLASSIFICATION IS ILLUSTRATIVE. Print-vs-replay
+    sub-classification reuses existing signals with a second heuristic
+    boundary, not calibrated against real attack samples.
+
+  - NO DEFENSE AGAINST A REPLAYED VIDEO OF A REAL BLINK/TURN. The active
+    challenge checks that a gesture happened, not that the camera feed is
+    live rather than a video replay of someone performing it.
+
+  - DASHBOARD FLOW IS UNTESTED. Session-state logic (retries, challenge
+    sequencing) is manually verified, not covered by the automated test
+    suite.
+
+
+================================================================================
+10. ROADMAP / NEXT STEPS
+================================================================================
+
+If asked "what's next" or "is this finished":
+
+TIER 1 - closes the credibility gap
+  - Collect a small real attack dataset - actual printed photos and screen
+    replays, not synthetic degradation.
+  - Empirically calibrate thresholds against that data via an ROC curve
+    instead of hand-picked constants.
+  - Report real accuracy metrics - confusion matrix, false-accept/
+    false-reject rates.
+
+TIER 2 - genuine new capability
+  - rPPG (remote photoplethysmography) - detect subtle skin-color
+    oscillation from blood flow, which a photo/screen/deepfake cannot
+    reproduce. Fits the existing frequency-domain theme (extracted via
+    FFT on a pixel-intensity time series) and would defeat the current
+    system's blind spot against video replay.
+  - Adversarial red-teaming - deliberately try to beat the system
+    (high-res print, video replay) and document what breaks.
+
+TIER 3 - engineering maturity
+  - CI pipeline - GitHub Actions running pytest on every push.
+  - Edge-case handling - no face for N seconds, poor lighting, camera
+    permission denied, a face joining mid-session.
+
+
+================================================================================
+11. APPENDIX: FILE MAP
+================================================================================
+
+  PERSON A
+    core/spatial_features.py
+    core/frequency_features.py
+    core/passive_classifier.py
+    scripts/train_toy_model.py
+
+  PERSON B
+    core/face_detector.py
+    core/active_challenge.py
+
+  PERSON C
+    core/fusion.py
+    ui/dashboard.py
+    ui/visualizer.py
+    utils/logger.py
+    main.py
+
+  SHARED (no single owner)
+    utils/constants.py - thresholds, landmark indices, DB path; every
+                         module reads from it
+    tests/             - covers all three people's modules
+
+
+================================================================================
+DeepCheck - face liveness & anti-spoofing demo
+github.com/chrisxcalvin/cv-project
+================================================================================
