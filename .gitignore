@@ -8,3 +8,11 @@ venv/
 # data, not source) - regenerated automatically by utils/logger.py.
 deepcheck_logs.db
 *.db
+
+# Calibration photos are real photos of team members' faces - keep the
+# folder structure (.gitkeep) tracked, never the images themselves.
+# Photos are shared team-to-team over a private drive link, not git -
+# see calibration_data/README.md.
+calibration_data/*/*.jpg
+calibration_data/*/*.jpeg
+calibration_data/*/*.png

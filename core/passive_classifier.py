@@ -92,7 +92,12 @@ class PassiveClassifier:
 
         weighted_breakdown = None
         if self.use_cnn:
-            real_conf = self._cnn_predict(sharpened)
+            # NOTE: must use the raw face_crop, not `sharpened` - the toy
+            # checkpoint (scripts/train_toy_model.py) was trained on plain
+            # resized RGB crops, never on blurred+Laplacian-sharpened
+            # images. Feeding `sharpened` here would silently move every
+            # inference off the model's training distribution.
+            real_conf = self._cnn_predict(face_crop)
             method = "cnn"
         else:
             # RULE-BASED FUSION (works without any training).
