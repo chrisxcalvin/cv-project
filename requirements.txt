@@ -3,6 +3,7 @@ opencv-python<4.12
 numpy<2
 scipy
 streamlit
+flask
 torch
 torchvision
 onnxruntime

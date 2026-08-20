@@ -14,6 +14,7 @@ import argparse
 import glob
 import os
 import sys
+import time
 
 import cv2
 
@@ -48,6 +49,17 @@ def main():
     print(f"[capture] category={args.category}  name={args.name}")
     print("[capture] SPACE = save frame, Q = quit.")
 
+    # Track the next filename index in memory rather than re-globbing the
+    # directory on every save. Re-globbing is what caused the "same index
+    # saved 4 times" bug: a held/auto-repeating SPACE key fires several
+    # keydown events faster than a new file becomes visible to glob() again
+    # (worse under OneDrive-synced folders, which can lag on refreshing a
+    # directory listing) - so multiple presses computed the same index and
+    # silently overwrote each other.
+    next_idx = next_index(out_dir, args.name, args.category)
+    last_save_time = 0.0
+    SAVE_DEBOUNCE_SECONDS = 0.5  # also guards against key-repeat double-saves
+
     try:
         while True:
             ret, frame = cap.read()
@@ -69,13 +81,17 @@ def main():
                 break
 
             if key == ord(" "):
+                now = time.time()
+                if now - last_save_time < SAVE_DEBOUNCE_SECONDS:
+                    continue  # ignore key-repeat / accidental double-press
                 if face_crop is None:
                     print("[capture] No face detected - not saved.")
                     continue
-                idx = next_index(out_dir, args.name, args.category)
-                out_path = os.path.join(out_dir, f"{args.name}_{args.category}_{idx}.jpg")
+                out_path = os.path.join(out_dir, f"{args.name}_{args.category}_{next_idx}.jpg")
                 cv2.imwrite(out_path, face_crop)
                 print(f"[capture] saved {out_path}")
+                next_idx += 1
+                last_save_time = now
     finally:
         cap.release()
         cv2.destroyAllWindows()

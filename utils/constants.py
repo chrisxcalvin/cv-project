@@ -49,8 +49,30 @@ CHALLENGE_TIMEOUT = 5.0
 # ---------------------------------------------------------------------------
 # Passive classifier / decision fusion thresholds
 # ---------------------------------------------------------------------------
-PASSIVE_ACCEPT_THRESHOLD = 0.75
-PASSIVE_REJECT_THRESHOLD = 0.30
+# Raised from 0.75. Real calibration data (calibration_data/, real vs.
+# replay - see README there) showed the shipped CNN checkpoint
+# (models/passive_spoof_model.pt, trained only on LFW + synthetic
+# JPEG/halftone degradation, never on a real screen replay) scores replay
+# photos HIGHER than real ones on average (replay mean 0.785 vs. real mean
+# 0.737, replay max 0.925). At the old 0.75 floor, 19 of 32 replay photos
+# (59%) in our sample would have auto-accepted, completely skipping the
+# active blink/turn challenge - a real bypass, not just an accuracy gap.
+# Real and replay confidence ranges overlap almost entirely (real
+# 0.45-0.89, replay 0.65-0.93), so no threshold below ~0.93 is safe. Set
+# above the observed replay max so passive alone can never auto-accept;
+# the active challenge is the actual safety gate until the model is
+# retrained on real presentation-attack photos instead of synthetic ones.
+PASSIVE_ACCEPT_THRESHOLD = 0.95
+# Lowered from 0.30 as a matching fix for the rule-based fallback path
+# (used automatically if models/passive_spoof_model.pt is ever missing):
+# with PASSIVE_FUSION_WEIGHTS/TEXTURE_SCORE_DIVISOR/FFT_SCORE_DIVISOR
+# recalibrated to real webcam data (see below), real calibration photos
+# legitimately scored as low as 0.18 under rule-based scoring - at 0.30,
+# ~16% of real photos would have been hard-rejected with no chance at the
+# active challenge. 0.18 sits just under the lowest real_confidence seen
+# on real photos so far. Harmless to the current CNN path too, since real
+# CNN scores never go anywhere near this low (min observed: 0.45).
+PASSIVE_REJECT_THRESHOLD = 0.18
 
 # SYLLABUS: Thresholding (Otsu) - texture-variance floor below which a face
 # crop is considered a suspiciously flat region (likely a printed photo)
@@ -75,6 +97,38 @@ FFT_HIGH_FREQ_RATIO = 0.15
 # OTSU_TEXTURE_THRESHOLD with only moderately elevated FFT energy leans
 # "print".
 REPLAY_FFT_RATIO_MIN = FFT_HIGH_FREQ_RATIO * 1.6
+
+# Rule-based fusion weights for PassiveClassifier.predict() (used only when
+# no CNN checkpoint is present). Originally 0.35/0.25/0.25/0.15
+# (texture/orb/fft/edge), all voting "higher score = more real".
+#
+# Recalibrated after real/replay calibration data (see calibration_data/
+# README.md) showed ORB keypoint count and Canny edge density are actively
+# BACKWARDS for screen replay: filming a screen creates moire interference
+# between the screen's sub-pixel grid and the webcam sensor, which *adds*
+# dense fine-grained texture across the whole face rather than smoothing it
+# out. A center-crop test (stripping the outer ~40% of each image, well
+# past any phone bezel) made the gap bigger, not smaller, confirming the
+# extra edges/keypoints come from the screen content itself, not capture
+# artifacts. That assumption ("more edges/keypoints = more real") still
+# plausibly holds for print vs. real (flat paper has no moire), so orb/edge
+# are down-weighted rather than removed - see calibration_data/README.md
+# for the full writeup and the print caveat (not yet calibrated, no print
+# samples collected).
+PASSIVE_FUSION_WEIGHTS = {"texture": 0.55, "orb": 0.10, "fft": 0.25, "edge": 0.10}
+
+# Normalization divisors for the texture/fft sub-scores above
+# (texture_score = min(texture_var / TEXTURE_SCORE_DIVISOR, 1.0), and
+# similarly for fft). The original 500.0 / 0.85 values were guesses never
+# checked against real webcam output: on actual calibration photos,
+# texture_var runs ~900-4400 (so /500.0 saturated texture_score to 1.0 for
+# EVERY image, real or replay) and fft_ratio runs ~0.919-0.933 (so /0.85
+# saturated fft_score to 0.0 for every image). Both features were
+# contributing constants, not signal - reweighting them alone (above) did
+# nothing until these were fixed too. Recalibrated to the observed data
+# range so the scores actually vary across images again.
+TEXTURE_SCORE_DIVISOR = 4000.0
+FFT_SCORE_DIVISOR = 0.935
 
 # ---------------------------------------------------------------------------
 # Face detection
