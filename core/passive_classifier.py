@@ -22,6 +22,9 @@ from utils.constants import (
     PASSIVE_REJECT_THRESHOLD,
     OTSU_TEXTURE_THRESHOLD,
     REPLAY_FFT_RATIO_MIN,
+    PASSIVE_FUSION_WEIGHTS,
+    TEXTURE_SCORE_DIVISOR,
+    FFT_SCORE_DIVISOR,
 )
 
 
@@ -92,17 +95,26 @@ class PassiveClassifier:
 
         weighted_breakdown = None
         if self.use_cnn:
-            real_conf = self._cnn_predict(sharpened)
+            # NOTE: must use the raw face_crop, not `sharpened` - the toy
+            # checkpoint (scripts/train_toy_model.py) was trained on plain
+            # resized RGB crops, never on blurred+Laplacian-sharpened
+            # images. Feeding `sharpened` here would silently move every
+            # inference off the model's training distribution.
+            real_conf = self._cnn_predict(face_crop)
             method = "cnn"
         else:
             # RULE-BASED FUSION (works without any training).
             # Each feature votes: higher score = more likely REAL.
-            texture_score = min(texture_var / 500.0, 1.0)      # variance -> 0-1
+            texture_score = min(texture_var / TEXTURE_SCORE_DIVISOR, 1.0)   # variance -> 0-1
             orb_score = min(orb_count / 200.0, 1.0)             # keypoints -> 0-1
-            fft_score = 1.0 - min(fft_ratio / 0.85, 1.0)        # inv: more high-freq = more spoof
+            fft_score = 1.0 - min(fft_ratio / FFT_SCORE_DIVISOR, 1.0)  # inv: more high-freq = more spoof
             edge_score = min(edge_density / 0.15, 1.0)          # edge density -> 0-1
 
-            weights = {"texture": 0.35, "orb": 0.25, "fft": 0.25, "edge": 0.15}
+            # orb/edge are down-weighted vs. texture/fft - real calibration
+            # data showed they're backwards for screen replay (moire
+            # inflates keypoints/edges instead of reducing them). See
+            # PASSIVE_FUSION_WEIGHTS in utils/constants.py for the writeup.
+            weights = PASSIVE_FUSION_WEIGHTS
             sub_scores = {"texture": texture_score, "orb": orb_score,
                           "fft": fft_score, "edge": edge_score}
 
