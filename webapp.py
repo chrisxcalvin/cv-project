@@ -37,6 +37,8 @@ from utils.constants import (
     MAX_FACES_ALLOWED,
     TEXTURE_SCORE_DIVISOR,
     FFT_SCORE_DIVISOR,
+    ORB_SCORE_DIVISOR,
+    DEVICE_BEZEL_PENALTY,
 )
 
 app = Flask(__name__)
@@ -90,7 +92,7 @@ def passive_result_to_json(passive_result: dict) -> dict:
     # always computed either way (see PassiveClassifier.predict()).
     sub_scores = {
         "texture": min(passive_result["texture_var"] / TEXTURE_SCORE_DIVISOR, 1.0),
-        "orb": min(passive_result["orb_keypoints"] / 200.0, 1.0),
+        "orb": min(passive_result["orb_keypoints"] / ORB_SCORE_DIVISOR, 1.0),
         "fft": min(passive_result["fft_ratio"] / FFT_SCORE_DIVISOR, 1.0),
         "edge": min(passive_result["edge_density"] / 0.15, 1.0),
     }
@@ -102,6 +104,7 @@ def passive_result_to_json(passive_result: dict) -> dict:
         "fft_ratio": passive_result["fft_ratio"],
         "edge_density": passive_result["edge_density"],
         "method": passive_result["method"],
+        "cnn_confidence": passive_result["cnn_confidence"],
         "spoof_type": passive_result["spoof_type"],
         "weighted_breakdown": passive_result["weighted_breakdown"],
         "sub_scores": sub_scores,
@@ -138,6 +141,17 @@ def api_verify():
         })
 
     passive_result = classifier.predict(face_crop)
+
+    # Device-bezel check: looks in the region AROUND the face (not the
+    # tight crop the rest of passive_result is based on) for long straight
+    # edges consistent with a phone/tablet/monitor bezel. Penalty, not a
+    # hard veto - see DEVICE_BEZEL_PENALTY in utils/constants.py.
+    bezel_detected, bezel_line_count = face_detector.detect_device_bezel(frame, bbox)
+    if bezel_detected:
+        passive_result["real_confidence"] = round(
+            max(0.0, passive_result["real_confidence"] - DEVICE_BEZEL_PENALTY), 4
+        )
+
     decision = fusion.decide(passive_result)
 
     response = {
@@ -146,6 +160,7 @@ def api_verify():
         "reason": decision.get("reason"),
         "passive": passive_result_to_json(passive_result),
         "face_crop": encode_image(face_crop),
+        "bezel_detected": bezel_detected,
     }
 
     if decision["verdict"] == "PENDING":
@@ -198,23 +213,16 @@ def api_challenge():
 
     glasses_mode = bool(body.get("glasses_mode"))
 
-    active_result = None
-    winning_frame = None
-    for frame in frames:
-        result = active_challenge.evaluate_single_frame(frame, challenge, glasses_mode=glasses_mode)
-        if result["passed"]:
-            active_result = result
-            winning_frame = frame
-            break
-        # Keep the best (most face-tracked) attempt seen so far so a
-        # total failure still reports a meaningful measurement instead of
-        # just "no face detected" from a single bad frame.
-        if active_result is None or (result["reason"] != "no_face_detected" and active_result["reason"] == "no_face_detected"):
-            active_result = result
-            winning_frame = frame
+    # Requires N_FRAME_CONFIRM CONSECUTIVE frames to satisfy the gesture,
+    # not just one lucky frame (see ActiveChallenge.evaluate_burst's
+    # docstring) - a single-frame check let a tilted photo fake a head
+    # turn during demo testing.
+    active_result, confirmed_frames = active_challenge.evaluate_burst(
+        frames, challenge, glasses_mode=glasses_mode
+    )
+    winning_frame = confirmed_frames[-1] if confirmed_frames else frames[-1]
 
-    frame = winning_frame
-    challenge_crop, _ = face_detector.detect_and_crop(frame)
+    challenge_crop, _ = face_detector.detect_and_crop(winning_frame)
     if challenge_crop is None:
         return jsonify({"error": "no_face", "message": "No face detected in challenge photo."})
 
@@ -227,11 +235,31 @@ def api_challenge():
             "challenge": {"type": challenge, **CHALLENGE_PROMPTS[challenge]},
         })
 
-    challenge_passive_result = classifier.predict(challenge_crop)
+    # Anti-swap check: re-score EVERY frame in the confirmed streak, not
+    # just the winning one - a lone well-angled/low-glare frame is much
+    # easier for a spoof to get lucky on than a whole streak. Taking the
+    # minimum means the weakest frame in the streak decides. Each frame
+    # also gets the same device-bezel penalty as /api/verify (see
+    # DEVICE_BEZEL_PENALTY in utils/constants.py).
+    challenge_confidences = []
+    for f in confirmed_frames:
+        crop, cbbox = face_detector.detect_and_crop(f)
+        if crop is None:
+            continue
+        conf = classifier.predict(crop)["real_confidence"]
+        if face_detector.detect_device_bezel(f, cbbox)[0]:
+            conf = max(0.0, conf - DEVICE_BEZEL_PENALTY)
+        challenge_confidences.append(conf)
+
+    if challenge_confidences:
+        challenge_passive_result = {"real_confidence": min(challenge_confidences)}
+    else:
+        challenge_passive_result = classifier.predict(challenge_crop)
+
     pending_passive_result = {"real_confidence": pending_confidence}
     decision = fusion.decide(pending_passive_result, active_result, challenge_passive_result)
 
-    db_logger.log_attempt(pending_passive_result, decision, active_result)
+    db_logger.log_attempt(pending_passive_result, decision, active_result, challenge_passive_result)
 
     session.pop("pending_challenge", None)
     session.pop("pending_confidence", None)
@@ -251,7 +279,7 @@ def api_challenge():
         "active_result": active_result,
         "measurement_note": thresholds.get(challenge),
         "challenge_photo_confidence": challenge_passive_result["real_confidence"],
-        "challenge_photo_reject_threshold": DecisionFusion.REJECT_THRESHOLD,
+        "challenge_photo_reject_threshold": DecisionFusion.CHALLENGE_REJECT_THRESHOLD,
     })
 
 

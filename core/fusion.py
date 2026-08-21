@@ -6,12 +6,17 @@
 Top-level decision fusion: combines the passive classifier's confidence with
 an optional active-challenge result into one final verdict.
 """
-from utils.constants import PASSIVE_ACCEPT_THRESHOLD, PASSIVE_REJECT_THRESHOLD
+from utils.constants import (
+    PASSIVE_ACCEPT_THRESHOLD,
+    PASSIVE_REJECT_THRESHOLD,
+    CHALLENGE_REJECT_THRESHOLD,
+)
 
 
 class DecisionFusion:
     ACCEPT_THRESHOLD = PASSIVE_ACCEPT_THRESHOLD
     REJECT_THRESHOLD = PASSIVE_REJECT_THRESHOLD
+    CHALLENGE_REJECT_THRESHOLD = CHALLENGE_REJECT_THRESHOLD
 
     def decide(self, passive_result: dict, active_result: dict = None,
                challenge_passive_result: dict = None) -> dict:
@@ -22,11 +27,11 @@ class DecisionFusion:
         and the active challenge outcome are combined via threshold bands
         into a single ACCEPT / REJECT / PENDING verdict:
 
-          real_confidence >= 0.75  -> ACCEPT (no challenge needed)
-          real_confidence <= 0.30  -> REJECT (no challenge needed)
-          between 0.30 and 0.75    -> depends on active_result
-            active passed          -> ACCEPT, unless the challenge photo
-                                       itself scores as a spoof (see below)
+          real_confidence >= PASSIVE_ACCEPT_THRESHOLD  -> ACCEPT (no challenge needed)
+          real_confidence <= PASSIVE_REJECT_THRESHOLD  -> REJECT (no challenge needed)
+          in between                                   -> depends on active_result
+            active passed          -> ACCEPT, unless the challenge photo scores
+                                       <= CHALLENGE_REJECT_THRESHOLD (see below)
             active failed / None   -> REJECT (or PENDING if not yet run)
 
         `challenge_passive_result`, if given, is the passive spoof-classifier
@@ -67,7 +72,7 @@ class DecisionFusion:
             }
 
         if (challenge_passive_result is not None
-                and challenge_passive_result["real_confidence"] <= self.REJECT_THRESHOLD):
+                and challenge_passive_result["real_confidence"] <= self.CHALLENGE_REJECT_THRESHOLD):
             return {
                 "verdict": "REJECT", "confidence": conf,
                 "active_used": True,

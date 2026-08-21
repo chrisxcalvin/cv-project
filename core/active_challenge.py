@@ -118,13 +118,15 @@ class ActiveChallenge:
         yaw_offset > 0  -> nose shifted toward the RIGHT_CHEEK_IDX side
         yaw_offset < 0  -> nose shifted toward the LEFT_CHEEK_IDX side
 
-        NOTE: browser webcam captures (st.camera_input, cv2.VideoCapture on a
-        laptop webcam) are effectively mirrored relative to the anatomical
-        labelling of MediaPipe's canonical face mesh - a user physically
-        turning their head to their own right measures as yaw_offset < 0
-        here, not > 0. The required_sign mapping in evaluate_single_frame()
-        and run_challenge() is calibrated to match the mirrored capture, not
-        this function's anatomical comment.
+        NOTE: browser webcam captures (the browser-camera path used by
+        webapp.py, and cv2.VideoCapture on a laptop webcam) are effectively
+        mirrored relative to the anatomical labelling of MediaPipe's
+        canonical face mesh - a user physically turning their head to their
+        own right measures as yaw_offset > 0 here, turning left as
+        yaw_offset < 0 (confirmed empirically 2026-08-21). Both
+        evaluate_single_frame() and run_challenge() use this same
+        convention - see evaluate_single_frame()'s required_sign for the
+        turn_left/turn_right mapping.
         """
         nose_x, _ = landmarks[NOSE_TIP_IDX]
         left_x, _ = landmarks[LEFT_CHEEK_IDX]
@@ -185,9 +187,13 @@ class ActiveChallenge:
             }
 
         if challenge in ("turn_left", "turn_right"):
-            # Mirrored capture: physically turning left/right yields the
-            # opposite sign of what the anatomical labelling would suggest.
-            required_sign = 1 if challenge == "turn_left" else -1
+            # Sign convention confirmed empirically against the real
+            # browser capture pipeline during demo testing (2026-08-21):
+            # physically turning left produces a NEGATIVE yaw_offset here,
+            # turning right a POSITIVE one - matching run_challenge()'s
+            # (the --live/cv2.VideoCapture path) convention below, which
+            # this function previously had backwards relative to.
+            required_sign = -1 if challenge == "turn_left" else 1
             passed = (yaw_offset * required_sign) >= HEAD_TURN_THRESHOLD
             reason = "head_turn_detected" if passed else "head_turn_insufficient"
             return {
@@ -210,6 +216,66 @@ class ActiveChallenge:
             "passed": False, "challenge": challenge,
             "reason": "unknown_challenge_type", "ear_min": None, "yaw_max_delta": None,
         }
+
+    # ------------------------------------------------------------------
+    # Burst evaluation (used by the Flask web app - webapp.py sends a short
+    # burst of frames captured over ~1s rather than one photo)
+    # ------------------------------------------------------------------
+    def evaluate_burst(self, frames, challenge, glasses_mode=False):
+        """
+        Evaluate an ordered burst of frames against `challenge`, requiring
+        N_FRAME_CONFIRM CONSECUTIVE frames to satisfy the gesture - the same
+        confirmation rule run_challenge() already uses for --live mode.
+
+        Demo testing found that accepting the FIRST single frame that
+        passes (the old per-frame loop in webapp.py) lets someone fake a
+        turn_left/turn_right by briefly tilting a printed/phone photo in
+        front of the camera: MediaPipe reads the resulting 2D landmark
+        shift the same as a real head turn, and only needs one lucky
+        frame. Requiring a consecutive streak makes that much harder to
+        fake with a quick tilt or a single well-angled video frame, and
+        gives fusion.py's anti-swap check a whole streak of frames to
+        re-verify instead of just one (see webapp.py's /api/challenge).
+
+        Returns (result, confirmed_frames):
+          result           - same shape as evaluate_single_frame()'s return
+          confirmed_frames - the list of raw frames making up the winning
+                             streak (empty if the challenge was never
+                             confirmed)
+        """
+        streak = []
+        best_attempt = None
+
+        for frame in frames:
+            result = self.evaluate_single_frame(frame, challenge, glasses_mode=glasses_mode)
+
+            streak = streak + [(frame, result)] if result["passed"] else []
+
+            if best_attempt is None or (
+                result["reason"] != "no_face_detected"
+                and best_attempt["reason"] == "no_face_detected"
+            ):
+                best_attempt = result
+
+            if len(streak) >= N_FRAME_CONFIRM:
+                confirmed_frames = [f for f, _ in streak]
+                final_result = dict(streak[-1][1])
+                final_result["reason"] = f"{challenge}_confirmed_{N_FRAME_CONFIRM}_frames"
+                return final_result, confirmed_frames
+
+        # Never confirmed a full streak. `best_attempt` is kept only for a
+        # useful diagnostic (it prefers a face-tracked frame over a
+        # no-face one) - it must NOT be allowed to report passed=True on
+        # its own, since it can legitimately BE the one lucky frame this
+        # method exists to stop from deciding the outcome by itself.
+        fallback = dict(best_attempt) if best_attempt is not None else {
+            "passed": False, "challenge": challenge, "reason": "no_face_detected",
+            "ear_min": None, "yaw_max_delta": None, "yaw_signed": None,
+        }
+        if fallback["passed"]:
+            fallback["reason"] = f"{fallback['reason']}_not_sustained"
+        fallback["passed"] = False
+        return fallback, []
 
     # ------------------------------------------------------------------
     # Continuous multi-frame challenge (used by main.py --live mode)

@@ -1,7 +1,18 @@
 """
 Analyzes calibration_data/<category>/ photos and suggests threshold values
-for utils/constants.py, using the exact same feature extractors the app
-uses at runtime (core/spatial_features.py, core/frequency_features.py).
+for utils/constants.py.
+
+Scores every image through PassiveClassifier.predict() directly (the exact
+function webapp.py and ui/dashboard.py call at runtime) rather than
+reimplementing the fusion formula here - a prior version of this script
+duplicated the rule-based weights/divisors by hand and drifted out of sync
+with utils/constants.py's recalibrated values (0.35/0.25/0.25/0.15 and
+500.0/0.85 here vs. the real 0.55/0.10/0.25/0.10 and 4000.0/0.935 in
+constants.py), silently producing suggestions fit to the WRONG formula.
+Calling predict() directly makes that class of drift impossible, and
+means these numbers automatically reflect the CNN+rule ensemble
+(core/passive_classifier.py) whenever models/passive_spoof_model.pt is
+present, not just the rule-based fallback.
 
 Currently covers real vs. replay only - print is skipped for now (no
 print photos collected yet). Anything that specifically needs a
@@ -21,8 +32,7 @@ import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.spatial_features import SpatialFeatureExtractor
-from core.frequency_features import FrequencyAnalyzer
+from core.passive_classifier import PassiveClassifier
 
 DATA_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "calibration_data")
 
@@ -43,19 +53,6 @@ def load_images(category):
             continue
         images.append((path, img))
     return images
-
-
-def extract_features(face_crop, spatial, frequency):
-    _, edge_density = spatial.canny_edges(face_crop)
-    texture_var, _ = spatial.otsu_texture_score(face_crop)
-    orb_count, _ = spatial.orb_keypoint_score(face_crop)
-    fft_ratio, _, _ = frequency.analyze(face_crop)
-    return {
-        "texture_var": texture_var,
-        "orb_keypoints": orb_count,
-        "fft_ratio": fft_ratio,
-        "edge_density": edge_density,
-    }
 
 
 def summarize(values):
@@ -111,8 +108,8 @@ def suggest_midpoint_threshold(real_values, replay_values, higher_means_real):
     return suggestion, separated
 
 
-def print_threshold_suggestions(per_category_features):
-    print("\n=== Suggested thresholds (real vs. replay only) ===")
+def print_threshold_suggestions(per_category_features, method_used):
+    print(f"\n=== Suggested thresholds (real vs. replay only, method={method_used}) ===")
 
     real = per_category_features["real"]
     replay = per_category_features["replay"]
@@ -155,50 +152,65 @@ def print_threshold_suggestions(per_category_features):
         "to separate print-vs-replay - skipped for now)"
     )
 
-    # Rule-based real_confidence, using the SAME weights as
-    # core/passive_classifier.py, so PASSIVE_ACCEPT/REJECT suggestions
-    # match what the app actually computes.
-    weights = {"texture": 0.35, "orb": 0.25, "fft": 0.25, "edge": 0.15}
-
-    def real_conf(feat):
-        texture_score = min(feat["texture_var"] / 500.0, 1.0)
-        orb_score = min(feat["orb_keypoints"] / 200.0, 1.0)
-        fft_score = 1.0 - min(feat["fft_ratio"] / 0.85, 1.0)
-        edge_score = min(feat["edge_density"] / 0.15, 1.0)
-        return (
-            weights["texture"] * texture_score
-            + weights["orb"] * orb_score
-            + weights["fft"] * fft_score
-            + weights["edge"] * edge_score
-        )
-
-    real_confs = [real_conf(f) for f in real["per_image"]]
-    replay_confs = [real_conf(f) for f in replay["per_image"]]
+    real_confs = real["real_confidence"]
+    replay_confs = replay["real_confidence"]
 
     if real_confs and replay_confs:
         real_stats = summarize(real_confs)
         replay_stats = summarize(replay_confs)
-        print(f"\nrule-based real_confidence: real mean={real_stats['mean']:.4f} "
+        print(f"\nreal_confidence ({method_used}): real mean={real_stats['mean']:.4f} "
               f"min={real_stats['min']:.4f}  |  replay mean={replay_stats['mean']:.4f} "
               f"max={replay_stats['max']:.4f}")
+
         accept_suggestion = max(replay_stats["max"], real_stats["mean"] * 0.9)
         reject_suggestion = min(real_stats["min"], replay_stats["mean"] * 1.1)
         if reject_suggestion > accept_suggestion:
             reject_suggestion, accept_suggestion = accept_suggestion, reject_suggestion
         print(f"PASSIVE_ACCEPT_THRESHOLD    ~ {accept_suggestion:.4f}")
         print(f"PASSIVE_REJECT_THRESHOLD    ~ {reject_suggestion:.4f}")
+
+        # CHALLENGE_REJECT_THRESHOLD (utils/constants.py): the anti-swap
+        # re-check run on the ACTIVE CHALLENGE photo (core/fusion.py), not
+        # the user's first photo. It can afford to sit closer to the real
+        # class than PASSIVE_REJECT_THRESHOLD does, since by that point
+        # the user has already performed a real gesture - there's no
+        # "don't punish an unconditioned first photo" excuse left, and its
+        # whole job is catching a replay swapped in for the gesture.
+        separated = real_stats["min"] > replay_stats["max"]
+        if separated:
+            gap = real_stats["min"] - replay_stats["max"]
+            challenge_suggestion = replay_stats["max"] + gap * 0.5
+            flag = ""
+        else:
+            # Overlapping ranges - no threshold cleanly separates the two
+            # classes. Suggest just above the observed replay max as the
+            # best available number, but say so plainly instead of
+            # quietly proposing something that can't actually work.
+            challenge_suggestion = replay_stats["max"] + 0.02
+            flag = ("  (WARNING: real min <= replay max - ranges overlap, "
+                    "NO threshold can cleanly separate these classes with "
+                    "this feature set / data. This is the best available "
+                    "number, not a safe guarantee.)")
+        print(f"CHALLENGE_REJECT_THRESHOLD  ~ {challenge_suggestion:.4f}{flag}")
     else:
         print("\nPASSIVE_ACCEPT/REJECT_THRESHOLD  not enough data")
+        print("CHALLENGE_REJECT_THRESHOLD       not enough data")
 
 
 def main():
-    spatial = SpatialFeatureExtractor()
-    frequency = FrequencyAnalyzer()
+    classifier = PassiveClassifier()
+    method_used = "rule_based"
+    if classifier.use_cnn:
+        print("[analyze] Note: a CNN checkpoint is loaded, but real_confidence "
+              "is rule-based regardless (see PassiveClassifier.predict()'s "
+              "CNN-mode branch for why) - cnn_confidence is computed but not "
+              "part of these numbers.")
 
     per_category_features = {
         category: {name: [] for name in FEATURE_NAMES} for category in CATEGORIES
     }
     for category in CATEGORIES:
+        per_category_features[category]["real_confidence"] = []
         per_category_features[category]["per_image"] = []
 
     for category in CATEGORIES:
@@ -208,10 +220,11 @@ def main():
             continue
         print(f"[analyze] {category}: {len(images)} image(s)")
         for path, img in images:
-            feats = extract_features(img, spatial, frequency)
+            result = classifier.predict(img)
             for name in FEATURE_NAMES:
-                per_category_features[category][name].append(feats[name])
-            per_category_features[category]["per_image"].append(feats)
+                per_category_features[category][name].append(result[name])
+            per_category_features[category]["real_confidence"].append(result["real_confidence"])
+            per_category_features[category]["per_image"].append(result)
 
     if not per_category_features["real"]["per_image"] or not per_category_features["replay"]["per_image"]:
         print("\n[analyze] Need at least one image in BOTH calibration_data/real/ "
@@ -219,7 +232,7 @@ def main():
         return
 
     print_summary_table(per_category_features)
-    print_threshold_suggestions(per_category_features)
+    print_threshold_suggestions(per_category_features, method_used)
 
     print(
         "\n[analyze] NOTE: 'print' category was skipped entirely (no samples "

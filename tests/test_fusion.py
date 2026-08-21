@@ -1,5 +1,9 @@
 from core.fusion import DecisionFusion
-from utils.constants import PASSIVE_ACCEPT_THRESHOLD, PASSIVE_REJECT_THRESHOLD
+from utils.constants import (
+    PASSIVE_ACCEPT_THRESHOLD,
+    PASSIVE_REJECT_THRESHOLD,
+    CHALLENGE_REJECT_THRESHOLD,
+)
 
 
 def _passive(conf):
@@ -45,6 +49,25 @@ def test_challenge_passed_but_challenge_photo_looks_spoofed_still_rejects():
     mid = (PASSIVE_ACCEPT_THRESHOLD + PASSIVE_REJECT_THRESHOLD) / 2
     active_result = {"passed": True, "reason": "blink_confirmed", "challenge": "blink"}
     challenge_passive = _passive(PASSIVE_REJECT_THRESHOLD)
+    decision = DecisionFusion().decide(_passive(mid), active_result, challenge_passive)
+    assert decision["verdict"] == "REJECT"
+    assert decision["reason"] == "challenge_photo_looks_spoofed"
+
+
+def test_challenge_photo_between_old_and_new_reject_bar_still_rejects():
+    """
+    Guards the anti-swap fix: a challenge photo scoring above the lenient
+    first-photo PASSIVE_REJECT_THRESHOLD but at/below the stricter
+    CHALLENGE_REJECT_THRESHOLD must still be rejected. This is exactly the
+    gap that let a video of someone performing the gesture (held up on a
+    phone after an initial spoof photo landed in the uncertain band) slip
+    through - see CHALLENGE_REJECT_THRESHOLD's comment in utils/constants.py.
+    """
+    assert CHALLENGE_REJECT_THRESHOLD > PASSIVE_REJECT_THRESHOLD  # sanity-check the fix is even active
+
+    mid = (PASSIVE_ACCEPT_THRESHOLD + PASSIVE_REJECT_THRESHOLD) / 2
+    active_result = {"passed": True, "reason": "blink_confirmed", "challenge": "blink"}
+    challenge_passive = _passive(CHALLENGE_REJECT_THRESHOLD)
     decision = DecisionFusion().decide(_passive(mid), active_result, challenge_passive)
     assert decision["verdict"] == "REJECT"
     assert decision["reason"] == "challenge_photo_looks_spoofed"

@@ -30,8 +30,21 @@ def test_uses_cnn_when_model_file_present():
     assert clf.use_cnn is True
 
     result = clf.predict(_dummy_crop())
-    assert result["method"] == "cnn"
+    # real_confidence stays rule-based even with a checkpoint loaded - see
+    # PassiveClassifier.predict()'s CNN-mode branch for why (calibration
+    # data showed the CNN's errors aren't one-directional, so blending it
+    # in hurts more than it helps). The CNN's own score is still exposed,
+    # just not decision-driving.
+    assert result["method"] == "rule_based"
     assert 0.0 <= result["real_confidence"] <= 1.0
+    assert result["cnn_confidence"] is not None
+    assert 0.0 <= result["cnn_confidence"] <= 1.0
+
+
+def test_cnn_confidence_is_none_without_a_checkpoint():
+    clf = PassiveClassifier(model_path="models/does_not_exist.pt")
+    result = clf.predict(_dummy_crop())
+    assert result["cnn_confidence"] is None
 
 
 def test_predict_result_has_expected_keys_regardless_of_method():
@@ -40,7 +53,7 @@ def test_predict_result_has_expected_keys_regardless_of_method():
     expected_keys = {
         "real_confidence", "texture_var", "orb_keypoints", "fft_ratio",
         "edge_density", "method", "spoof_type", "weighted_breakdown",
-        "kp_frame", "fft_display", "edges",
+        "cnn_confidence", "kp_frame", "fft_display", "edges",
     }
     assert expected_keys.issubset(result.keys())
 

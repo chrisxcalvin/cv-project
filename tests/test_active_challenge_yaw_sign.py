@@ -47,7 +47,10 @@ def active_challenge(monkeypatch):
     ac.close()
 
 
-def test_positive_yaw_offset_passes_turn_left_not_turn_right(active_challenge, monkeypatch):
+def test_positive_yaw_offset_passes_turn_right_not_turn_left(active_challenge, monkeypatch):
+    # Sign corrected 2026-08-21 against real demo testing: a physical RIGHT
+    # turn measures as positive yaw_offset (previously had this backwards -
+    # see the required_sign comment in evaluate_single_frame()).
     monkeypatch.setattr(
         active_challenge, "_get_landmarks",
         lambda frame: _landmarks_with_nose_at(_NOSE_X_POSITIVE_YAW),
@@ -56,11 +59,12 @@ def test_positive_yaw_offset_passes_turn_left_not_turn_right(active_challenge, m
     left = active_challenge.evaluate_single_frame(_DUMMY_FRAME, "turn_left")
     right = active_challenge.evaluate_single_frame(_DUMMY_FRAME, "turn_right")
 
-    assert left["passed"] is True
-    assert right["passed"] is False
+    assert left["passed"] is False
+    assert right["passed"] is True
 
 
-def test_negative_yaw_offset_passes_turn_right_not_turn_left(active_challenge, monkeypatch):
+def test_negative_yaw_offset_passes_turn_left_not_turn_right(active_challenge, monkeypatch):
+    # Sign corrected 2026-08-21 - see test_positive_yaw_offset_... above.
     monkeypatch.setattr(
         active_challenge, "_get_landmarks",
         lambda frame: _landmarks_with_nose_at(_NOSE_X_NEGATIVE_YAW),
@@ -69,8 +73,8 @@ def test_negative_yaw_offset_passes_turn_right_not_turn_left(active_challenge, m
     left = active_challenge.evaluate_single_frame(_DUMMY_FRAME, "turn_left")
     right = active_challenge.evaluate_single_frame(_DUMMY_FRAME, "turn_right")
 
-    assert left["passed"] is False
-    assert right["passed"] is True
+    assert left["passed"] is True
+    assert right["passed"] is False
 
 
 class _FakeCap:
@@ -82,15 +86,12 @@ class _FakeCap:
 def test_run_challenge_turn_left_and_turn_right_are_self_consistent_opposites(
     active_challenge, monkeypatch,
 ):
-    # NOTE: run_challenge() (the --live path, raw cv2.VideoCapture frames) is
-    # NOT asserted here to share evaluate_single_frame()'s sign convention
-    # (the Streamlit st.camera_input path) - browser-captured photos and raw
-    # webcam frames can have different mirroring depending on OS/driver, and
-    # core/active_challenge.py's own comments flag this as unresolved
-    # ("if --live mode's turn detection also reads backwards for you, flip
-    # these two comparisons the same way"). Verify the actual direction
-    # against a real webcam in --live mode before demo day; this test only
-    # pins that turn_left and turn_right can't both fire for the same yaw.
+    # run_challenge() (the --live path, raw cv2.VideoCapture frames) already
+    # used the same sign convention evaluate_single_frame() was just
+    # corrected to match (2026-08-21, confirmed against real demo testing) -
+    # this pins that self-consistency (turn_left/turn_right can't both fire
+    # for the same yaw) and cross-checks it against evaluate_single_frame
+    # for the same landmarks, so the two paths can't silently diverge again.
     monkeypatch.setattr(
         active_challenge, "_get_landmarks",
         lambda frame: _landmarks_with_nose_at(_NOSE_X_NEGATIVE_YAW),
@@ -103,3 +104,8 @@ def test_run_challenge_turn_left_and_turn_right_are_self_consistent_opposites(
         _FakeCap(), challenge="turn_left", show_window=False, timeout=0.2,
     )
     assert right["passed"] != left["passed"]
+
+    single_frame_left = active_challenge.evaluate_single_frame(_DUMMY_FRAME, "turn_left")
+    single_frame_right = active_challenge.evaluate_single_frame(_DUMMY_FRAME, "turn_right")
+    assert left["passed"] == single_frame_left["passed"]
+    assert right["passed"] == single_frame_right["passed"]

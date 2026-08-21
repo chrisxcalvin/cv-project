@@ -5,13 +5,16 @@
 """
 Passive spoof classifier.
 
-Works WITHOUT a trained model: when models/passive_spoof_model.pt is not
-present, real_confidence is produced by a rule-based fusion of the Otsu
+real_confidence is always produced by a rule-based fusion of the Otsu
 texture score, ORB keypoint count, FFT high-frequency ratio, and Canny edge
 density (SYLLABUS: Decision Fusion at the feature level, distinct from the
-higher-level passive+active fusion in core/fusion.py).
+higher-level passive+active fusion in core/fusion.py) - this works whether
+or not models/passive_spoof_model.pt is present.
 
-When the model file IS present, a MobileNetV2 classifier is used instead.
+When the model file IS present, a MobileNetV2 classifier ALSO runs and its
+score is exposed as "cnn_confidence" for transparency/analytics (proving the
+CNN inference code path works end-to-end), but it does not drive
+real_confidence - see predict()'s CNN-mode branch for why.
 """
 import os
 import cv2
@@ -25,6 +28,8 @@ from utils.constants import (
     PASSIVE_FUSION_WEIGHTS,
     TEXTURE_SCORE_DIVISOR,
     FFT_SCORE_DIVISOR,
+    ORB_SCORE_DIVISOR,
+    EDGE_SCORE_DIVISOR,
 )
 
 
@@ -76,11 +81,16 @@ class PassiveClassifier:
             "orb_keypoints":   int,
             "fft_ratio":       float,
             "edge_density":    float,
-            "method":          "cnn" | "rule_based"
+            "method":          "rule_based" (always - see the CNN-mode branch below
+                               for why the CNN doesn't drive the decision anymore)
             "spoof_type":      "printed_photo" | "screen_replay" |
                                "unclear_spoof_type" | None (None if not spoof-leaning)
-            "weighted_breakdown": dict[str, float] | None (None in "cnn" mode -
-                               CNN scores have no per-feature breakdown to show)
+            "weighted_breakdown": dict[str, float] - rule-based per-feature
+                               contribution, always populated now (see below)
+            "cnn_confidence":  float | None - the CNN's own real/spoof score,
+                               computed and exposed for transparency/analytics
+                               whenever a checkpoint is loaded, but NOT used
+                               to decide real_confidence (see below)
             "kp_frame":        np.ndarray (BGR),
             "fft_display":     np.ndarray (BGR),
             "edges":           np.ndarray (single-channel edge map),
@@ -93,49 +103,70 @@ class PassiveClassifier:
         orb_count, kp_frame = self.spatial.orb_keypoint_score(face_crop)
         fft_ratio, fft_display, _ = self.frequency.analyze(face_crop)
 
-        weighted_breakdown = None
+        # RULE-BASED FUSION - the decision-driving score regardless of
+        # whether a CNN checkpoint is loaded (see the CNN-mode branch below).
+        # Each feature votes: higher score = more likely REAL.
+        texture_score = min(texture_var / TEXTURE_SCORE_DIVISOR, 1.0)   # variance -> 0-1
+        orb_score = min(orb_count / ORB_SCORE_DIVISOR, 1.0)  # keypoints -> 0-1
+        fft_score = 1.0 - min(fft_ratio / FFT_SCORE_DIVISOR, 1.0)  # inv: more high-freq = more spoof
+        # INVERTED vs. the original "higher edge = more real" assumption -
+        # see EDGE_SCORE_DIVISOR / PASSIVE_FUSION_WEIGHTS in utils/constants.py
+        # for the calibration writeup. Higher edge density measured as more
+        # likely SPOOF for this webcam/phone (moire from filming a screen),
+        # matching an earlier team finding this project had briefly
+        # contradicted with mismatched calibration data.
+        edge_score = 1.0 - min(edge_density / EDGE_SCORE_DIVISOR, 1.0)
+
+        # See PASSIVE_FUSION_WEIGHTS in utils/constants.py for the current
+        # weighting and the writeup on how it was calibrated.
+        weights = PASSIVE_FUSION_WEIGHTS
+        sub_scores = {"texture": texture_score, "orb": orb_score,
+                      "fft": fft_score, "edge": edge_score}
+
+        # SYLLABUS: Decision Fusion - weighted combination of the Otsu
+        # texture score, ORB keypoint count, FFT high-frequency energy,
+        # and Canny edge density into one real/spoof confidence value.
+        rule_conf = sum(weights[k] * sub_scores[k] for k in weights)
+
+        # Explainability breakdown: how many of the final real_conf points
+        # each feature actually contributed, not just its raw 0-1
+        # sub-score - lets the dashboard show *why* the number came out the
+        # way it did instead of just the number itself.
+        weighted_breakdown = {
+            "texture": round(weights["texture"] * sub_scores["texture"], 4),
+            "orb": round(weights["orb"] * sub_scores["orb"], 4),
+            "fft": round(weights["fft"] * sub_scores["fft"], 4),
+            "edge": round(weights["edge"] * sub_scores["edge"], 4),
+        }
+
+        cnn_conf = None
         if self.use_cnn:
             # NOTE: must use the raw face_crop, not `sharpened` - the toy
             # checkpoint (scripts/train_toy_model.py) was trained on plain
             # resized RGB crops, never on blurred+Laplacian-sharpened
             # images. Feeding `sharpened` here would silently move every
             # inference off the model's training distribution.
-            real_conf = self._cnn_predict(face_crop)
-            method = "cnn"
-        else:
-            # RULE-BASED FUSION (works without any training).
-            # Each feature votes: higher score = more likely REAL.
-            texture_score = min(texture_var / TEXTURE_SCORE_DIVISOR, 1.0)   # variance -> 0-1
-            orb_score = min(orb_count / 200.0, 1.0)             # keypoints -> 0-1
-            fft_score = 1.0 - min(fft_ratio / FFT_SCORE_DIVISOR, 1.0)  # inv: more high-freq = more spoof
-            edge_score = min(edge_density / 0.15, 1.0)          # edge density -> 0-1
+            cnn_conf = self._cnn_predict(face_crop)
 
-            # orb/edge are down-weighted vs. texture/fft - real calibration
-            # data showed they're backwards for screen replay (moire
-            # inflates keypoints/edges instead of reducing them). See
-            # PASSIVE_FUSION_WEIGHTS in utils/constants.py for the writeup.
-            weights = PASSIVE_FUSION_WEIGHTS
-            sub_scores = {"texture": texture_score, "orb": orb_score,
-                          "fft": fft_score, "edge": edge_score}
+            # Computed and exposed (see "cnn_confidence" below) but NOT
+            # blended into real_confidence. An earlier version of this
+            # code took min(cnn_conf, rule_conf) as a defensive "either
+            # detector can veto" ensemble, reasoning the CNN could only
+            # err toward scoring spoofs too generously. Real calibration
+            # data (calibration_data/, see PASSIVE_REJECT_THRESHOLD's
+            # comment in utils/constants.py) proved that assumption wrong:
+            # across TWO independent calibration rounds the CNN - trained
+            # only on LFW + synthetic JPEG/halftone degradation, never a
+            # real phone/print photo - scored replay HIGHER than real on
+            # average, AND its real-photo scores were inconsistent enough
+            # (0.49-0.74 in the latest round) to drag min(cnn, rule) for
+            # GENUINE users below where the calibrated rule_conf alone
+            # would have correctly accepted them. The CNN's errors aren't
+            # one-directional, so a min()-veto hurts more than it helps -
+            # rule_conf alone separated the same dataset cleanly on its own.
 
-            # SYLLABUS: Decision Fusion - weighted combination of the Otsu
-            # texture score, ORB keypoint count, FFT high-frequency energy,
-            # and Canny edge density into one real/spoof confidence value.
-            real_conf = sum(weights[k] * sub_scores[k] for k in weights)
-            method = "rule_based"
-
-            # Explainability breakdown: how many of the final real_conf
-            # points each feature actually contributed, not just its raw
-            # 0-1 sub-score - lets the dashboard show *why* the number came
-            # out the way it did instead of just the number itself.
-            weighted_breakdown = {
-                "texture": round(weights["texture"] * sub_scores["texture"], 4),
-                "orb": round(weights["orb"] * sub_scores["orb"], 4),
-                "fft": round(weights["fft"] * sub_scores["fft"], 4),
-                "edge": round(weights["edge"] * sub_scores["edge"], 4),
-            }
-
-        real_conf = round(float(real_conf), 4)
+        method = "rule_based"
+        real_conf = round(float(rule_conf), 4)
         spoof_type = classify_spoof_type(real_conf, texture_var, fft_ratio)
 
         return {
@@ -147,6 +178,7 @@ class PassiveClassifier:
             "method": method,
             "spoof_type": spoof_type,
             "weighted_breakdown": weighted_breakdown,
+            "cnn_confidence": round(float(cnn_conf), 4) if cnn_conf is not None else None,
             "kp_frame": kp_frame,
             "fft_display": fft_display,
             "edges": edges,

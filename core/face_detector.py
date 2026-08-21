@@ -94,6 +94,66 @@ class FaceDetector:
         results = self._detector.process(rgb)
         return len(results.detections) if results.detections else 0
 
+    def detect_device_bezel(self, frame, bbox, margin_ratio=1.4, min_lines=2):
+        """
+        SYLLABUS: Edge Detection / Feature Detection - looks for long,
+        straight, axis-aligned line segments (Hough Line Transform) in the
+        region immediately surrounding the detected face, not the face
+        itself. A phone/tablet/monitor bezel held up to the camera produces
+        a small number of very long, very straight edges close to the face;
+        an ordinary live face + background rarely does, especially within
+        such a tight margin around the face box.
+
+        Best-effort heuristic, not independently calibrated against real
+        bezel/non-bezel samples (no time to collect them before demo day) -
+        used as a confidence PENALTY in webapp.py, not a hard veto, so a
+        false positive (e.g. a picture frame or doorway edge close behind
+        someone's head) degrades a live user's score rather than silently
+        blocking them outright.
+
+        Returns (detected: bool, line_count: int).
+        """
+        if frame is None or bbox is None:
+            return False, 0
+
+        x, y, w, h, _ = bbox
+        frame_h, frame_w = frame.shape[:2]
+        cx, cy = x + w / 2.0, y + h / 2.0
+        half_w = (w / 2.0) * margin_ratio
+        half_h = (h / 2.0) * margin_ratio
+
+        x1 = int(max(0, cx - half_w))
+        y1 = int(max(0, cy - half_h))
+        x2 = int(min(frame_w, cx + half_w))
+        y2 = int(min(frame_h, cy + half_h))
+        if x2 <= x1 or y2 <= y1:
+            return False, 0
+
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return False, 0
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+
+        roi_span = max(roi.shape[0], roi.shape[1])
+        min_len = max(roi_span * 0.4, 20)
+        lines = cv2.HoughLinesP(
+            edges, 1, np.pi / 180, threshold=60,
+            minLineLength=min_len, maxLineGap=10,
+        )
+        if lines is None:
+            return False, 0
+
+        straight_count = 0
+        for line in lines:
+            lx1, ly1, lx2, ly2 = line[0]
+            angle = abs(np.degrees(np.arctan2(ly2 - ly1, lx2 - lx1)))
+            if angle < 6 or angle > 174 or 84 < angle < 96:
+                straight_count += 1
+
+        return straight_count >= min_lines, straight_count
+
     def draw_bbox(self, frame, bbox):
         """Draw the detected bounding box + confidence score on `frame` in place."""
         if bbox is None:
